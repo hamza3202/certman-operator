@@ -79,7 +79,7 @@ func (c *ACMEClient) UpdateAccount(email string) (err error) {
 }
 
 // CreateOrder accepts and appends domain names to the acme.Identifier.
-// It then calls acme.Client.NewOrder and returns nil if successfull
+// It then calls acme.Client.NewOrder and returns nil if successful
 // and an error if an error occurs.
 func (c *ACMEClient) CreateOrder(domains []string) (err error) {
 	var certDomains []string
@@ -282,6 +282,10 @@ func NewClient(kubeClient client.Client) (*ACMEClient, error) {
 	privateKey, err := getLetsEncryptAccountPrivateKey(kubeClient)
 	if err != nil {
 		return nil, err
+	}
+
+	if privateKey == nil {
+		return nil, errors.New("private key cannot be empty")
 	}
 	acmeClient.Account = acme.Account{PrivateKey: privateKey, URL: accountURL}
 

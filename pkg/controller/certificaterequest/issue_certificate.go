@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 
 	"github.com/go-logr/logr"
@@ -38,7 +39,8 @@ import (
 // form of resource record. Certificates are then generated and issued to kubernetes via corev1.
 func (r *ReconcileCertificateRequest) IssueCertificate(reqLogger logr.Logger, cr *certmanv1alpha1.CertificateRequest, certificateSecret *corev1.Secret) error {
 	timer := prometheus.NewTimer(localmetrics.MetricIssueCertificateDuration)
-	defer localmetrics.UpdateCertificateIssueDurationMetric(timer.ObserveDuration())
+	
+	defer timer.ObserveDuration()
 
 	// Get DNS client from CR.
 	dnsClient, err := r.getClient(cr)
@@ -49,12 +51,14 @@ func (r *ReconcileCertificateRequest) IssueCertificate(reqLogger logr.Logger, cr
 
 	proceed, err := dnsClient.ValidateDNSWriteAccess(reqLogger, cr)
 	if err != nil {
+		reqLogger.Error(err, "failed to validate dns write access")
 		return err
 	}
 
 	if proceed {
 		reqLogger.Info("write permissions for DNS has been validated")
 	} else {
+		err = errors.New("failed to get write access to DNS record")
 		reqLogger.Error(err, "failed to get write access to DNS record")
 		return err
 	}
@@ -79,10 +83,12 @@ func (r *ReconcileCertificateRequest) IssueCertificate(reqLogger logr.Logger, cr
 
 	err = leClient.CreateOrder(cr.Spec.DnsNames)
 	if err != nil {
+		reqLogger.Error(err, "failed to create order")
 		return err
 	}
 	URL, err := leClient.GetOrderURL()
 	if err != nil {
+		reqLogger.Error(err, "failed to get order url")
 		return err
 	}
 	reqLogger.Info("created a new order with Let's Encrypt.", "URL", URL)
@@ -125,7 +131,7 @@ func (r *ReconcileCertificateRequest) IssueCertificate(reqLogger logr.Logger, cr
 			return err
 		}
 
-		reqLogger.Info("challenge successfully completed")
+		reqLogger.Info("challenge successfuly completed")
 	}
 
 	reqLogger.Info("generating new key")
@@ -198,7 +204,7 @@ func (r *ReconcileCertificateRequest) IssueCertificate(reqLogger logr.Logger, cr
 	// that were used from dns in this zone.
 	err = dnsClient.DeleteAcmeChallengeResourceRecords(reqLogger, cr)
 	if err != nil {
-		reqLogger.Error(err, "error occurred deleting acme challenge resource records from Route53")
+		reqLogger.Error(err, "error occurred deleting acme challenge resource records from %v", dnsClient.GetDNSName())
 	}
 
 	return nil

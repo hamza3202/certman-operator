@@ -25,6 +25,7 @@ import (
 
 	"github.com/go-logr/logr"
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,13 +35,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	certmanv1alpha1 "github.com/openshift/certman-operator/pkg/apis/certman/v1alpha1"
 	"github.com/openshift/certman-operator/pkg/controller/utils"
+	"github.com/openshift/certman-operator/pkg/localmetrics"
 )
 
 var log = logf.Log.WithName("controller_clusterdeployment")
@@ -105,6 +107,12 @@ type ReconcileClusterDeployment struct {
 func (r *ReconcileClusterDeployment) Reconcile(request reconcile.Request) (reconcile.Result, error) {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 	reqLogger.Info("reconciling ClusterDeployment")
+
+	timer := prometheus.NewTimer(localmetrics.MetricClusterDeploymentReconcileDuration)
+	defer func() {
+		reconcileDuration := timer.ObserveDuration()
+		reqLogger.WithValues("Duration", reconcileDuration).Info("Reconcile complete.")
+	}()
 
 	// Fetch the ClusterDeployment instance
 	cd := &hivev1.ClusterDeployment{}
@@ -312,7 +320,7 @@ func (r *ReconcileClusterDeployment) getCurrentCertificateRequests(cd *hivev1.Cl
 
 	// get all CRs in the cluster's namespace
 	currentCRs := &certmanv1alpha1.CertificateRequestList{}
-	if err := r.client.List(context.TODO(), &client.ListOptions{Namespace: cd.Namespace}, currentCRs); err != nil {
+	if err := r.client.List(context.TODO(), currentCRs, client.InNamespace(cd.Namespace)); err != nil {
 		logger.Error(err, "error listing current CertificateRequests")
 		return certReqsForCluster, err
 	}
@@ -421,6 +429,18 @@ func createCertificateRequest(certBundleName string, secretName string, domains 
 					Name: cd.Spec.Platform.AWS.CredentialsSecretRef.Name,
 				},
 				Region: cd.Spec.Platform.AWS.Region,
+			},
+		}
+	}
+
+	// Azure platform
+	if cd.Spec.Platform.Azure != nil {
+		cr.Spec.Platform = certmanv1alpha1.Platform{
+			Azure: &certmanv1alpha1.AzurePlatformSecrets{
+				Credentials: corev1.LocalObjectReference{
+					Name: cd.Spec.Platform.Azure.CredentialsSecretRef.Name,
+				},
+				ResourceGroupName: cd.Spec.Platform.Azure.BaseDomainResourceGroupName,
 			},
 		}
 	}

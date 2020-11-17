@@ -21,8 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	awsclient "github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
@@ -37,9 +39,12 @@ import (
 )
 
 const (
-	awsCredsSecretIDKey     = "aws_access_key_id"
-	awsCredsSecretAccessKey = "aws_secret_access_key"
-	resourceRecordTTL       = 60
+	awsCredsSecretIDKey        = "aws_access_key_id"
+	awsCredsSecretAccessKey    = "aws_secret_access_key"
+	resourceRecordTTL          = 60
+	clientMaxRetries           = 25
+	retryerMaxRetries          = 10
+	retryerMinThrottleDelaySec = 1
 )
 
 // awsClient implements the Client interface
@@ -102,6 +107,10 @@ func (c *awsClient) createR53TXTRecordChange(name *string, action string, value 
 		},
 	}
 	return change, nil
+}
+
+func (c *awsClient) GetDNSName() string {
+	return "Route53"
 }
 
 func (c *awsClient) AnswerDNSChallenge(reqLogger logr.Logger, acmeChallengeToken string, domain string, cr *certmanv1alpha1.CertificateRequest) (fqdn string, err error) {
@@ -221,14 +230,14 @@ func (c *awsClient) ValidateDNSWriteAccess(reqLogger logr.Logger, cr *certmanv1a
 					return false, err
 				}
 
-				// After successfull write test clean up the test record and test deletion of that record.
+				// After successful write test clean up the test record and test deletion of that record.
 				input.ChangeBatch.Changes[0].Action = aws.String(route53.ChangeActionDelete)
 				_, err = c.client.ChangeResourceRecordSets(input)
 				if err != nil {
 					reqLogger.Error(err, "Error while deleting Write Access record")
 					return false, err
 				}
-				// If Write and Delete are successfull return clean.
+				// If Write and Delete are successful return clean.
 				return true, nil
 			}
 		}
@@ -238,7 +247,7 @@ func (c *awsClient) ValidateDNSWriteAccess(reqLogger logr.Logger, cr *certmanv1a
 }
 
 // DeleteAcmeChallengeResourceRecords spawns an AWS client, constructs baseDomain to retrieve the HostedZones. The ResourceRecordSets are
-// then requested, if returned and validated, the record is updated to an empty struct to remove the ACME challange.
+// then requested, if returned and validated, the record is updated to an empty struct to remove the ACME challenge.
 func (c *awsClient) DeleteAcmeChallengeResourceRecords(reqLogger logr.Logger, cr *certmanv1alpha1.CertificateRequest) error {
 	hostedZoneOutput, err := c.client.ListHostedZones(&route53.ListHostedZonesInput{})
 	if err != nil {
@@ -329,7 +338,18 @@ func (c *awsClient) DeleteAcmeChallengeResourceRecords(reqLogger logr.Logger, cr
 // a client. If secrets fail to return, the IAM role of the masters is used to create a
 // new session for the client.
 func NewClient(kubeClient client.Client, secretName, namespace, region string) (*awsClient, error) {
-	awsConfig := &aws.Config{Region: aws.String(region)}
+	awsConfig := &aws.Config{
+		Region: aws.String(region),
+		// MaxRetries to limit the number of attempts on failed API calls
+		MaxRetries: aws.Int(clientMaxRetries),
+		// Set MinThrottleDelay to 1 second
+		Retryer: awsclient.DefaultRetryer{
+			// Set NumMaxRetries to 10 (default is 3) for failed retries
+			NumMaxRetries: retryerMaxRetries,
+			// Set MinThrottleDelay to 1s (default is 500ms)
+			MinThrottleDelay: retryerMinThrottleDelaySec * time.Second,
+		},
+	}
 	if secretName != "" {
 		secret := &corev1.Secret{}
 		err := kubeClient.Get(context.TODO(),

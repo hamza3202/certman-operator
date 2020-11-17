@@ -21,28 +21,30 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	certmanv1alpha1 "github.com/openshift/certman-operator/pkg/apis/certman/v1alpha1"
 	cClient "github.com/openshift/certman-operator/pkg/clients"
 	"github.com/openshift/certman-operator/pkg/controller/utils"
+	"github.com/openshift/certman-operator/pkg/localmetrics"
 )
 
 const (
-	controllerName = "controller_certificaterequest"
+	controllerName          = "controller_certificaterequest"
+	maxConcurrentReconciles = 10
 )
 
 var log = logf.Log.WithName(controllerName)
@@ -60,14 +62,18 @@ func newReconciler(mgr manager.Manager) reconcile.Reconciler {
 		client:        mgr.GetClient(),
 		scheme:        mgr.GetScheme(),
 		clientBuilder: cClient.NewClient,
-		recorder:      mgr.GetRecorder(controllerName),
 	}
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
 func add(mgr manager.Manager, r reconcile.Reconciler) error {
 
-	c, err := controller.New("certificaterequest-controller", mgr, controller.Options{Reconciler: r})
+	o := controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
+	}
+
+	c, err := controller.New("certificaterequest-controller", mgr, o)
 	if err != nil {
 		return err
 	}
@@ -95,7 +101,6 @@ var _ reconcile.Reconciler = &ReconcileCertificateRequest{}
 type ReconcileCertificateRequest struct {
 	client        client.Client
 	scheme        *runtime.Scheme
-	recorder      record.EventRecorder
 	clientBuilder func(kubeClient client.Client, platfromSecret certmanv1alpha1.Platform, namespace string) (cClient.Client, error)
 }
 
@@ -105,6 +110,15 @@ func (r *ReconcileCertificateRequest) Reconcile(request reconcile.Request) (reco
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 
 	reqLogger.Info("reconciling CertificateRequest")
+
+	timer := prometheus.NewTimer(localmetrics.MetricCertificateRequestReconcileDuration)
+	defer func() {
+		reconcileDuration := timer.ObserveDuration()
+		reqLogger.WithValues("Duration", reconcileDuration).Info("Reconcile complete.")
+	}()
+
+	// Init the certificate request counter if nor already done
+	localmetrics.CheckInitCounter(r.client)
 
 	// Fetch the CertificateRequest cr
 	cr := &certmanv1alpha1.CertificateRequest{}
@@ -130,6 +144,7 @@ func (r *ReconcileCertificateRequest) Reconcile(request reconcile.Request) (reco
 	// Add finalizer if not exists
 	if !utils.ContainsString(cr.ObjectMeta.Finalizers, certmanv1alpha1.CertmanOperatorFinalizerLabel) {
 		reqLogger.Info("adding finalizer to the certificate request")
+		localmetrics.IncrementCertRequestsCounter()
 		cr.ObjectMeta.Finalizers = append(cr.ObjectMeta.Finalizers, certmanv1alpha1.CertmanOperatorFinalizerLabel)
 		if err := r.client.Update(context.TODO(), cr); err != nil {
 			reqLogger.Error(err, err.Error())
@@ -167,6 +182,7 @@ func (r *ReconcileCertificateRequest) Reconcile(request reconcile.Request) (reco
 			return reconcile.Result{}, err
 		}
 
+		localmetrics.AddCertificateIssuance("renewal")
 		err = r.client.Update(context.TODO(), found)
 		if err != nil {
 			return reconcile.Result{}, err
@@ -223,6 +239,8 @@ func (r *ReconcileCertificateRequest) finalizeCertificateRequest(reqLogger logr.
 			return reconcile.Result{}, err
 		}
 	}
+	
+	localmetrics.DecrementCertRequestsCounter()
 	reqLogger.Info("certificaterequest has been deleted")
 	return reconcile.Result{}, nil
 }
@@ -248,6 +266,7 @@ func (r *ReconcileCertificateRequest) createCertificateSecret(reqLogger logr.Log
 	}
 
 	reqLogger.Info("creating secret with certificates")
+	localmetrics.AddCertificateIssuance("create")
 
 	err = r.client.Create(context.TODO(), certificateSecret)
 	if err != nil {
